@@ -29,6 +29,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from topjarumbenang import BrownThreadTipTracker
+
 from PySide6.QtCore import Qt, QTimer, QRectF, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -94,6 +96,7 @@ DEFAULTS.update(
     ecc_on=True,
     loop=True,
     guides=False,
+    thread_on=True,
 )
 
 BACKENDS = [
@@ -177,7 +180,7 @@ def validate_parameters(p, top=True):
         ):
             raise ValueError(f"Parameter tidak valid: {key}")
 
-    for key in ("hsv_on", "invert", "ecc_on", "loop", "guides"):
+    for key in ("hsv_on", "invert", "ecc_on", "loop", "guides", "thread_on"):
         if not isinstance(p[key], bool):
             raise ValueError(f"Parameter harus boolean: {key}")
 
@@ -480,7 +483,7 @@ def draw_guides(frame, p):
     return out
 
 
-def draw_detection(frame, result):
+def draw_detection(frame, result, thread=None, thread_on=True):
     out = frame.copy()
     if result:
         cv2.ellipse(out, result["ellipse"], (0, 255, 0), 1, cv2.LINE_AA)
@@ -494,6 +497,19 @@ def draw_detection(frame, result):
         out, label, (16, 28), cv2.FONT_HERSHEY_SIMPLEX,
         0.6, (0, 255, 0), 1, cv2.LINE_AA,
     )
+
+    if thread_on:
+        if thread:
+            cv2.ellipse(out, thread["tip_ellipse"], (0, 255, 255), 2, cv2.LINE_AA)
+            tip = tuple(round(v) for v in thread["tip"])
+            cv2.circle(out, tip, 2, (0, 0, 255), -1, cv2.LINE_AA)
+            thread_label = f"BENANG TIP {thread['tip'][0]:.1f},{thread['tip'][1]:.1f}"
+        else:
+            thread_label = "BENANG TIP: tidak terdeteksi"
+        cv2.putText(
+            out, thread_label, (16, 52), cv2.FONT_HERSHEY_SIMPLEX,
+            0.55, (0, 255, 255), 1, cv2.LINE_AA,
+        )
     return out
 
 
@@ -608,6 +624,7 @@ class CaptureWorker(threading.Thread):
                 if self.top and self.initial_reference is not None
                 else None
             )
+            thread_tracker = BrownThreadTipTracker() if self.top else None
             raw = None
             index = -1
             failures = 0
@@ -660,6 +677,7 @@ class CaptureWorker(threading.Thread):
                     self.events.put(("reference", raw.copy()))
 
                 result = None
+                thread = None
                 adjusted = raw
                 mask = np.zeros(raw.shape[:2], np.uint8)
                 gray = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
@@ -669,6 +687,8 @@ class CaptureWorker(threading.Thread):
                     adjusted, mask, gray = prepare_image(raw, p)
                     if self.top:
                         result, note = tracker.detect(gray, p)
+                        if p.get("thread_on", True) and thread_tracker is not None:
+                            thread = thread_tracker.detect(adjusted)
                     else:
                         note = "SIDE: preview; detektor belum ditambahkan."
                 except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
@@ -681,6 +701,7 @@ class CaptureWorker(threading.Thread):
                     "mask": mask,
                     "gray": gray,
                     "result": result,
+                    "thread": thread,
                     "note": note,
                     "index": index,
                     "ms": elapsed_ms,
@@ -926,6 +947,7 @@ class CameraPane(QGroupBox):
         if top:
             tracking_form = self.add_tab(tabs, "Tracking")
             self.add_check(tracking_form, "ecc_on", "Aktifkan ECC")
+            self.add_check(tracking_form, "thread_on", "Deteksi ujung benang")
             self.add_check(tracking_form, "guides", "Tampilkan panduan referensi")
             self.add_fields(tracking_form, TRACK_FIELDS)
 
@@ -1235,9 +1257,12 @@ class CameraPane(QGroupBox):
             out = packet["adjusted"]
 
         if mode == 0 and self.top:
-            if self.parameters()["guides"]:
-                out = draw_guides(out, self.parameters())
-            out = draw_detection(out, packet["result"])
+            p = self.parameters()
+            if p["guides"]:
+                out = draw_guides(out, p)
+            out = draw_detection(
+                out, packet["result"], packet.get("thread"), p.get("thread_on", True)
+            )
 
         self.shown = out
         self.view.set_frame(out)
@@ -1260,6 +1285,13 @@ class CameraPane(QGroupBox):
             text += f" | X={cx:.2f}, Y={cy:.2f} px | match={result['score']:.3f}"
             if result["ecc"] is not None:
                 text += f" | ECC={result['ecc']:.3f}"
+        thread = packet.get("thread")
+        if thread:
+            tx, ty = thread["tip"]
+            text += (
+                f" | benang={tx:.1f},{ty:.1f} "
+                f"th={thread['local_thickness']:.1f}px"
+            )
         self.stats.setText(text)
 
     def calibrate(self):
