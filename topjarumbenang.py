@@ -1,9 +1,10 @@
-"""Pelacak lubang jarum kiri + ujung benang coklat.
+"""Pelacak lubang jarum kiri + ujung bebas benang coklat di sisi kanan.
 
-Kalibrasi ini khusus untuk video 2026-09-15-133849.webm.
-Perubahan utama dari versi sebelumnya:
-1) referensi lubang jarum dikalibrasi ulang ke bukaan putih pada ujung jarum hitam di kiri;
-2) marker ujung benang berupa oval yang skalanya mengikuti ketebalan lokal benang.
+Benang coklat masuk dari tepi kanan. Ujung yang dilacak adalah ujung bebasnya
+(ujung yang tidak terpotong batas gambar), dengan posisi subpiksel.
+
+Saat ujung diam, koordinat diratakan supaya tidak bergetar. Saat ujung
+berpindah, marker langsung mengikuti pengukuran baru.
 """
 
 import argparse
@@ -23,14 +24,20 @@ NEEDLE_SEARCH_BOX = (0.00, 0.10, 0.40, 0.80)
 NEEDLE_MIN_MATCH = 0.67
 NEEDLE_SCALES = tuple(np.arange(0.75, 1.26, 0.05))
 
-# ===== Segmentasi benang coklat =====
-THREAD_ROI = (0.16, 0.10, 0.74, 0.68)
-THREAD_HSV_LOW = (2, 70, 18)
-THREAD_HSV_HIGH = (28, 255, 210)
-THREAD_MIN_AREA = 35.0
+# ===== Segmentasi benang coklat di sisi kanan =====
+# Hue rendah + saturasi tinggi: benang tembaga/coklat, bukan latar hampir putih.
+THREAD_HSV_LOW = (0, 60, 18)
+THREAD_HSV_HIGH = (22, 255, 230)
+THREAD_MIN_AREA = 250.0
+THREAD_MIN_WIDTH = 30
 THREAD_MIN_RIGHT_X = 0.50
-THREAD_TIP_PERCENTILE = 1.0
-THREAD_TIP_BAND_PX = 8.0
+# Ujung = kolom pertama yang ketebalannya mencapai rasio ini terhadap badan benang.
+THREAD_TIP_THICKNESS_RATIO = 0.30
+# Di bawah radius ini (px/frame) ujung dianggap diam dan diratakan.
+THREAD_STILL_RADIUS = 3.2
+THREAD_STILL_ALPHA = 0.55
+THREAD_QUIET_RADIUS = 1.6
+THREAD_QUIET_ALPHA = 0.32
 
 
 def transformed_ellipse(ellipse, matrix):
@@ -114,112 +121,229 @@ class NeedleHoleTracker:
 
 
 class BrownThreadTipTracker:
-    """Deteksi ujung kiri benang coklat dan ukuran lokal penampang ujungnya."""
+    """Ujung bebas benang coklat yang masuk dari sisi kanan.
+
+    Titik ukur adalah pusat penampang di muka ujung, subpiksel, pada mask
+    sebelum penutupan morfologi supaya ujung tidak bergeser akibat kernel.
+    """
 
     def __init__(self):
-        self.prev_tip = None
+        self.prev_raw = None
+        self.smooth = None
+        self.smooth_thickness = None
+        self.smooth_angle = 0.0
         self.missed = 0
 
     @staticmethod
-    def _tip_geometry(component_mask, x0, y0):
-        ys, xs = np.where(component_mask > 0)
-        if len(xs) == 0:
-            return None
-
-        xs = xs.astype(np.float32) + float(x0)
-        ys = ys.astype(np.float32) + float(y0)
-
-        lead_x = float(np.percentile(xs, THREAD_TIP_PERCENTILE))
-        band = xs <= (lead_x + THREAD_TIP_BAND_PX)
-        if int(np.count_nonzero(band)) < 5:
-            band = xs <= (float(xs.min()) + THREAD_TIP_BAND_PX + 4.0)
-        if int(np.count_nonzero(band)) == 0:
-            return None
-
-        bx = xs[band]
-        by = ys[band]
-        tip_x = float(np.median(bx))
-        tip_y = float(np.median(by))
-
-        # Ketebalan lokal di muka ujung benang. Percentile menahan outlier/streak.
-        y_lo = float(np.percentile(by, 5.0))
-        y_hi = float(np.percentile(by, 95.0))
-        local_thickness = max(16.0, min(65.0, (y_hi - y_lo) + 4.0))
-
-        # Oval tetap sempit pada arah gerak, tetapi tingginya mengikuti lebar/ketebalan benang.
-        oval_w = max(8.0, min(30.0, local_thickness * 0.38))
-        oval_h = local_thickness
-        tip_ellipse = ((tip_x, tip_y), (oval_w, oval_h), 0.0)
-
-        return (tip_x, tip_y), tip_ellipse, local_thickness
-
-    def detect(self, frame):
-        h, w = frame.shape[:2]
-        x0, y0, x1, y1 = [
-            int(v * s) for v, s in zip(THREAD_ROI, (w, h, w, h))
-        ]
-        roi = frame[y0:y1, x0:x1]
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-        mask = cv2.inRange(
+    def _masks(frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        opened = cv2.inRange(
             hsv,
             np.array(THREAD_HSV_LOW, np.uint8),
             np.array(THREAD_HSV_HIGH, np.uint8),
         )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 3), np.uint8))
+        opened = cv2.morphologyEx(opened, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        closed = cv2.morphologyEx(
+            opened,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3)),
+        )
+        return opened, closed
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        candidates = []
-
-        for contour in contours:
-            area = float(cv2.contourArea(contour))
-            if area < THREAD_MIN_AREA:
-                continue
-
-            x, y, bw, bh = cv2.boundingRect(contour)
-            gx, gy = x0 + x, y0 + y
-            right_x = gx + bw
-            if right_x < int(THREAD_MIN_RIGHT_X * w):
-                continue
-            if bw < 3 or bh < 3:
-                continue
-
-            component = np.zeros(mask.shape, np.uint8)
-            cv2.drawContours(component, [contour], -1, 255, -1)
-            geom = self._tip_geometry(component, x0, y0)
-            if geom is None:
-                continue
-
-            tip, tip_ellipse, local_thickness = geom
-            tip_x, tip_y = tip
-            score = area + 2.5 * bw + 0.5 * bh
-
-            if self.prev_tip is not None and self.missed <= 5:
-                d = float(np.hypot(tip_x - self.prev_tip[0], tip_y - self.prev_tip[1]))
-                score -= d
-
-            candidates.append(
-                {
-                    "score": score,
-                    "area": area,
-                    "bbox": (gx, gy, bw, bh),
-                    "tip": tip,
-                    "tip_ellipse": tip_ellipse,
-                    "local_thickness": float(local_thickness),
-                }
-            )
-
-        if not candidates:
-            self.missed += 1
-            if self.missed > 5:
-                self.prev_tip = None
+    def _column_profile(self, binary):
+        ys, xs = np.where(binary > 0)
+        if len(xs) == 0:
+            return None
+        x0 = int(xs.min())
+        x1 = int(xs.max())
+        length = x1 - x0 + 1
+        if length < 24:
             return None
 
-        best = max(candidates, key=lambda item: item["score"])
-        self.prev_tip = best["tip"]
-        self.missed = 0
+        med = np.full(length, np.nan, np.float64)
+        thick = np.zeros(length, np.float64)
+        for x in range(x0, x1 + 1):
+            column = ys[xs == x]
+            if len(column) == 0:
+                continue
+            med[x - x0] = float(np.median(column))
+            thick[x - x0] = float(len(column))
+
+        good = np.isfinite(med)
+        if int(good.sum()) < 12:
+            return None
+        index = np.arange(length)
+        filled = np.interp(index, index[good], med[good])
+        smooth = np.empty_like(filled)
+        for i in range(length):
+            smooth[i] = np.median(filled[max(0, i - 4) : min(length, i + 5)])
+        thickness = np.convolve(thick, np.ones(5) / 5.0, mode="same")
+        thickness[0] = thick[0]
+        thickness[1] = thick[1]
+        thickness[-1] = thick[-1]
+        thickness[-2] = thick[-2]
+        return x0, smooth, thickness, thick
+
+    def _measure_tip(self, opened, component):
+        profile = self._column_profile(cv2.bitwise_and(opened, component))
+        if profile is None:
+            return None
+        x0, centerline, thickness, raw_thick = profile
+        length = len(centerline)
+        body = thickness[int(0.35 * length) : int(0.75 * length)]
+        body = body[body > 1.0]
+        if len(body) < 4:
+            return None
+        body_thickness = float(np.median(body))
+        if body_thickness < 4.0:
+            return None
+
+        threshold = max(3.0, THREAD_TIP_THICKNESS_RATIO * body_thickness)
+        hit = None
+        for i in range(0, length - 5):
+            if (
+                thickness[i] >= threshold
+                and thickness[i + 1] >= threshold
+                and thickness[i + 2] >= threshold
+                and thickness[i + 3] >= threshold
+            ):
+                hit = i
+                break
+        if hit is None:
+            return None
+
+        if hit > 0 and thickness[hit] > thickness[hit - 1]:
+            frac = (threshold - thickness[hit - 1]) / max(thickness[hit] - thickness[hit - 1], 1e-3)
+            tip_index = (hit - 1) + float(np.clip(frac, 0.0, 1.0))
+        else:
+            tip_index = float(hit)
+
+        near = float(np.interp(tip_index + 5.0, np.arange(length), centerline))
+        shaft_x = tip_index + np.arange(12.0, 42.0)
+        shaft_x = shaft_x[(shaft_x >= 1.0) & (shaft_x <= length - 2.0)]
+        if len(shaft_x) < 8:
+            return None
+        shaft_y = np.interp(shaft_x, np.arange(length), centerline)
+        slope = float(np.polyfit(shaft_x, shaft_y, 1)[0])
+        if abs(slope) > 1.0:
+            slope = 0.0
+            tip_y = near
+        else:
+            tip_y = near - 5.0 * slope
+        tip_x = float(x0) + tip_index
+
+        height, width = opened.shape
+        if not (2.0 <= tip_x < width - 2.0 and 2.0 <= tip_y < height - 2.0):
+            return None
+
+        loc = int(np.clip(round(tip_index + 12.0), 0, length - 1))
+        local = float(np.median(raw_thick[max(0, loc - 2) : loc + 3]))
+        local = float(np.clip(local if local > 1.0 else body_thickness, 8.0, 70.0))
+        angle = float(np.degrees(np.arctan(slope)))
+        along = float(np.clip(local * 0.34, 8.0, 22.0))
+        ellipse = ((tip_x, tip_y), (along, local), angle)
+        return {
+            "tip": (tip_x, tip_y),
+            "tip_ellipse": ellipse,
+            "local_thickness": local,
+            "angle": angle,
+        }
+
+    def _candidates(self, opened, closed):
+        height, width = closed.shape
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(closed)
+        found = []
+        for label in range(1, count):
+            x, y, bw, bh, area = [int(v) for v in stats[label]]
+            if area < THREAD_MIN_AREA or bw < THREAD_MIN_WIDTH:
+                continue
+            if x + bw < int(THREAD_MIN_RIGHT_X * width):
+                continue
+            if y > int(0.92 * height):
+                continue
+            component = np.where(labels == label, 255, 0).astype(np.uint8)
+            measured = self._measure_tip(opened, component)
+            if measured is None:
+                continue
+            measured["area"] = float(area)
+            measured["bbox"] = (x, y, bw, bh)
+            measured["score"] = float(area) + 2.0 * bw
+            found.append(measured)
+        return found
+
+    def _choose(self, found):
+        if not found:
+            return None
+        best = max(found, key=lambda item: item["score"])
+        if self.prev_raw is None or self.missed > 6:
+            return best
+        px, py = self.prev_raw
+        nearby = []
+        for item in found:
+            if item["area"] < 0.35 * best["area"]:
+                continue
+            x, y, bw, bh = item["bbox"]
+            if (x - 40) <= px <= (x + bw + 40) and (y - 50) <= py <= (y + bh + 50):
+                tip_x, tip_y = item["tip"]
+                item = dict(item)
+                item["score"] -= 6.0 * float(np.hypot(tip_x - px, tip_y - py))
+                nearby.append(item)
+        if nearby:
+            return max(nearby, key=lambda item: item["score"])
         return best
+
+    def _stabilize(self, raw_tip, thickness, angle):
+        raw = np.array(raw_tip, np.float64)
+        if self.smooth is None or self.missed > 4:
+            self.smooth = raw.copy()
+            self.smooth_thickness = float(thickness)
+            self.smooth_angle = float(angle)
+        else:
+            step = float(np.hypot(*(raw - self.prev_raw))) if self.prev_raw is not None else 99.0
+            if step <= THREAD_QUIET_RADIUS:
+                alpha = THREAD_QUIET_ALPHA
+            elif step <= THREAD_STILL_RADIUS:
+                alpha = THREAD_STILL_ALPHA
+            else:
+                alpha = 1.0
+            self.smooth = self.smooth + alpha * (raw - self.smooth)
+            self.smooth_thickness = self.smooth_thickness + alpha * (float(thickness) - self.smooth_thickness)
+            delta_angle = (float(angle) - self.smooth_angle + 180.0) % 360.0 - 180.0
+            self.smooth_angle += alpha * delta_angle
+        self.prev_raw = raw
+        self.missed = 0
+        return (
+            float(self.smooth[0]),
+            float(self.smooth[1]),
+            float(self.smooth_thickness),
+            float(self.smooth_angle),
+        )
+
+    def detect(self, frame):
+        opened, closed = self._masks(frame)
+        chosen = self._choose(self._candidates(opened, closed))
+        if chosen is None:
+            self.missed += 1
+            if self.missed > 6:
+                self.prev_raw = None
+                self.smooth = None
+                self.smooth_thickness = None
+            return None
+
+        tip_x, tip_y, local, angle = self._stabilize(
+            chosen["tip"], chosen["local_thickness"], chosen["angle"]
+        )
+        along = float(np.clip(local * 0.34, 8.0, 22.0))
+        ellipse = ((tip_x, tip_y), (along, local), angle)
+        return {
+            "score": chosen["score"],
+            "area": chosen["area"],
+            "bbox": chosen["bbox"],
+            "tip": (tip_x, tip_y),
+            "tip_ellipse": ellipse,
+            "local_thickness": local,
+            "angle": angle,
+        }
 
 
 def draw(frame, needle, thread):
@@ -235,12 +359,14 @@ def draw(frame, needle, thread):
     cv2.putText(out, txt, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
 
     if thread is not None:
-        tip = tuple(int(round(v)) for v in thread["tip"])
-        cv2.ellipse(out, thread["tip_ellipse"], (0, 255, 255), 2, cv2.LINE_AA)
+        tip_x, tip_y = thread["tip"]
+        tip = (int(round(tip_x)), int(round(tip_y)))
+        cv2.ellipse(out, thread["tip_ellipse"], (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.drawMarker(out, tip, (0, 0, 255), cv2.MARKER_CROSS, 16, 1, cv2.LINE_AA)
         cv2.circle(out, tip, 2, (0, 0, 255), -1, cv2.LINE_AA)
-        txt = f"BENANG TIP {tip[0]},{tip[1]}"
+        txt = f"UJUNG BENANG {tip_x:.1f},{tip_y:.1f}"
     else:
-        txt = "BENANG TIP: tidak terdeteksi"
+        txt = "UJUNG BENANG: tidak terdeteksi"
     cv2.putText(out, txt, (14, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
 
     return out
